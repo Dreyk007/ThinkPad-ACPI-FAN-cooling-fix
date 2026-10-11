@@ -154,9 +154,22 @@ sudo tee /usr/local/sbin/lenovo-fan-unlock.sh << 'EOF'
 #!/bin/bash
 set -euo pipefail
 
-CALL_NODE="/proc/acpi/call"
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+# Set to 1 to enable custom Intel RAPL power limits (requires kernel intel_rapl)
+ENABLE_RAPL_TUNING=0
 
-# Wait for /proc/acpi/call interface to become writable (up to 5 seconds)
+# Power limits in Watts (effective only if ENABLE_RAPL_TUNING=1)
+# Recommended for E15 Gen 4: PL1=32W (sustained), PL2=45W (burst)
+PL1_WATTS=32
+PL2_WATTS=45
+# ==============================================================================
+
+CALL_NODE="/proc/acpi/call"
+RAPL_DIR="/sys/class/powercap/intel-rapl/intel-rapl:0"
+
+# Wait for /proc/acpi/call interface (up to 5s)
 for i in {1..10}; do
     if [ -w "$CALL_NODE" ]; then
         break
@@ -166,11 +179,11 @@ for i in {1..10}; do
 done
 
 if [ ! -w "$CALL_NODE" ]; then
-    logger -t lenovo-fan-unlock "ERROR: /proc/acpi/call is not available"
+    logger -t lenovo-tune "ERROR: /proc/acpi/call is not available"
     exit 1
 fi
 
-# 1. Unlock DPTE master gate via IETM._OSC (CAP1 bit 0 = 1)
+# 1. Unlock DPTE master gate via IETM._OSC
 echo '\_SB.IETM._OSC b00000000000000000000000000000000 1 2 b0000000001000000' > "$CALL_NODE"
 
 # 2. Force Desk Mode (clear VCQL lap mode flag)
@@ -182,7 +195,14 @@ echo '\_SB.PC00.LPCB.EC.HKEY.DYTC 0x0017D001' > "$CALL_NODE"
 # 4. Lock DPTE gate back to 0 (freeze 3900 RPM table against OS downgrades)
 echo '\_SB.IETM._OSC b00000000000000000000000000000000 1 2 b0000000000000000' > "$CALL_NODE"
 
-logger -t lenovo-fan-unlock "ThinkPad E15 Gen 4: 3900 RPM table active, DPTE gate locked"
+# 5. Optional: Apply CPU power limits via native kernel RAPL
+if [ "$ENABLE_RAPL_TUNING" -eq 1 ] && [ -d "$RAPL_DIR" ]; then
+    echo "$((PL1_WATTS * 1000000))" > "$RAPL_DIR/constraint_0_power_limit_uw"
+    echo "$((PL2_WATTS * 1000000))" > "$RAPL_DIR/constraint_1_power_limit_uw"
+    logger -t lenovo-tune "ThinkPad E15: 3900 RPM active, RAPL set to PL1=${PL1_WATTS}W PL2=${PL2_WATTS}W"
+else
+    logger -t lenovo-tune "ThinkPad E15: 3900 RPM active, RAPL tuning disabled"
+fi
 EOF
 
 sudo chmod +x /usr/local/sbin/lenovo-fan-unlock.sh
@@ -291,3 +311,15 @@ stress -c $(nproc) --timeout 45s
 * **Acoustics & Idle:** In idle and low-load scenarios, the EC curve continues to scale down or turn off entirely ($0\text{--}2200\text{ RPM}$). Full speed is engaged only under thermal stress.
 
 * **Skin Temperature:** When running heavy workloads while holding the laptop on your lap, the underside chassis may feel warmer than under stock Linux settings because higher sustained TDP is maintained.
+
+## Optional: Power Limits Tuning (PL1 / PL2)
+
+By default, this tool only unlocks the fan speed limit (3900+ RPM).
+
+If you want to maximize sustained multi-core performance (e.g. for heavy compilation) without relying on buggy third-party daemons under Secure Boot, you can enable native **Intel RAPL** tuning directly inside the script:
+
+1. Open `/usr/local/sbin/lenovo-fan-unlock.sh`
+2. Change `ENABLE_RAPL_TUNING=0` to `ENABLE_RAPL_TUNING=1`
+3. (Optional) Adjust `PL1_WATTS` (default: 32W) and `PL2_WATTS` (default: 45W)
+
+For detailed benchmarks, why `throttled` fails under Kernel Lockdown, and how the hardware behaves on battery, see [docs/power-limits.md](docs/power-limits.md).
